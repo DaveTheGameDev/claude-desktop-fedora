@@ -818,7 +818,7 @@ build_host_launcher() {
   #    time on the socket existing; expanded by the wrapper, not here).
   local runcmd
   if [[ $ISOLATE_HOME -eq 1 ]]; then
-    runcmd="$(printf 'env "${SYS_BUS[@]}" HOME=%q %q %s' "$BOX_HOME" "$claude_bin" "$flags")"
+    runcmd="$(printf 'env "${SYS_BUS[@]}" "${WM_PREFS[@]}" HOME=%q %q %s' "$BOX_HOME" "$claude_bin" "$flags")"
   else
     runcmd="$(printf 'env "${SYS_BUS[@]}" %q %s' "$claude_bin" "$flags")"
   fi
@@ -829,6 +829,8 @@ build_host_launcher() {
     printf '# Launches Claude Desktop inside the "%s" distrobox container.\n' "$NAME"
     printf 'NAME=%q\n' "$NAME"
     printf 'SYSTEM_BUS=%q\n' "$SYSTEM_BUS"
+    printf 'ISOLATE_HOME=%q\n' "$ISOLATE_HOME"
+    printf 'BOX_HOME=%q\n' "$BOX_HOME"
     cat <<'WRAP'
 # Host system D-Bus for logind suspend/resume signals (see --no-system-bus).
 SYS_BUS=()
@@ -858,6 +860,20 @@ fix_stale_net() {
   podman stop -t 10 "$NAME" >/dev/null 2>&1 || true
 }
 fix_stale_net
+# Titlebar buttons. The isolated home has no dconf database, so GTK inside the
+# container sees GNOME's schema default ("appmenu:close") and the window shows
+# only a close button. Mirror just the host's button layout into a GSettings
+# keyfile and point the app at it - one key, not the whole host dconf.
+WM_PREFS=()
+if [[ "$ISOLATE_HOME" == 1 ]] && command -v gsettings >/dev/null 2>&1; then
+  layout="$(gsettings get org.gnome.desktop.wm.preferences button-layout 2>/dev/null)"
+  if [[ -n "$layout" ]]; then
+    kf="$BOX_HOME/.config/glib-2.0/settings/keyfile"
+    mkdir -p "$(dirname "$kf")"
+    printf '[org/gnome/desktop/wm/preferences]\nbutton-layout=%s\n' "$layout" > "$kf"
+    WM_PREFS=(GSETTINGS_BACKEND=keyfile)
+  fi
+fi
 WRAP
     printf 'exec distrobox enter --name %q -- %s "$@"\n' "$NAME" "$runcmd"
   } > "$HOST_BIN"

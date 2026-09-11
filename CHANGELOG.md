@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed**: the Claude window showed only a close button — no minimize/maximize — because
+  the isolated container home has no dconf database, so GTK fell back to GNOME's default
+  `appmenu:close` layout. The launcher now mirrors the host's
+  `org.gnome.desktop.wm.preferences button-layout` into a one-key GSettings keyfile in the
+  container home and starts the app with `GSETTINGS_BACKEND=keyfile`. Applies on the next
+  launch after running *Repair app-menu entry* (or any update), which rewrites the launcher.
+
 ## 1.3.0 — 2026-08-30
 
 - **Renamed**: the package is now `claude-desktop-fedora` (was `claude-desktop-distrobox`)
