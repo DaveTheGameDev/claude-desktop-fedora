@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.1 — 2026-09-11
 
 - **Fixed**: the Claude window showed only a close button — no minimize/maximize — because
   the isolated container home has no dconf database, so GTK fell back to GNOME's default
