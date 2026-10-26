@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- **Fedora Atomic / Bazzite support**: image-based hosts (rpm-ostree/bootc) are detected via
+  `/run/ostree-booted`, or chosen with the new `--host auto|atomic|classic` (`--atomic`,
+  `--classic`). Atomic mode never runs `dnf install` (missing tools stop with an
+  `rpm-ostree install` hint) and never self-updates an RPM in place.
+- **Fixed**: user folders and `--share` dirs are now mounted at their logical path too
+  (`/home/you/…`), not only the resolved one (`/var/home/you/…`). On hosts where `/home` is a
+  symlink, drag-and-drop and *Attach file* from the file manager silently failed. Existing
+  containers are offered a `--recreate`.
+- **Fixed**: an unset XDG folder (which falls back to `$HOME`) could mount the whole home when
+  `$HOME` is a symlink — the guard now compares resolved paths.
+- **Fixed**: the launcher could start itself inside the container and crash with
+  `exec: distrobox: not found` when the real home is mounted in the box (atomic hosts,
+  `--full-home`): `command -v claude-desktop` found the host launcher in `~/.local/bin`. The
+  app binary is now looked up from the package (`dpkg -L`). Fix it with *Repair app-menu entry*
+  (`--refresh-launcher`).
+- **NVIDIA**: distrobox `--nvidia` is passed automatically when `nvidia-smi -L` works; override
+  with `--nvidia` / `--no-nvidia`.
+- Explicit `--host` / `--nvidia` choices carry over to GUI actions, the launcher's right-click
+  actions and the auto-update timer.
+- On atomic hosts the installer warns that distrobox always mounts the real home
+  (`/var/home/$USER`, and over `/home/$USER` at every start), so home isolation is off there
+  (documented in the README).
+- **Fixed** (atomic hosts): that `/home/$USER` bind made the read-only Documents/Desktop/Pictures
+  mounts writable again. An `--init-hooks` step now re-binds them read-only at every container
+  start. Containers created earlier need `--recreate`.
+
 ## 1.3.1 — 2026-09-11
 
 - **Fixed**: the Claude window showed only a close button — no minimize/maximize — because

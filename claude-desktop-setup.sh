@@ -82,10 +82,18 @@ USER_DIRS=1                    # 1 => expose the standard XDG user folders
                                #      paths (file:///home/you/...); if those
                                #      paths do not exist inside the container
                                #      the drop and the import silently fail.
-declare -a USER_DIR_MOUNTS=()  # resolved "<path>:<ro|rw>" entries (filled at create)
+declare -a USER_DIR_MOUNTS=()  # resolved "<real>:<logical>:<ro|rw>" entries (filled at create)
 SYSTEM_BUS=1                   # 1 => hand the app the host's SYSTEM D-Bus so it
                                #      gets logind's real suspend/resume signals
                                #      (distrobox only forwards the session bus)
+HOST_MODE="auto"               # auto | atomic | classic — how the host OS is
+                               #      managed. atomic = image-based Fedora
+                               #      (rpm-ostree/bootc: Bazzite, Silverblue,
+                               #      Kinoite, …) where `dnf install` cannot
+                               #      work; auto checks /run/ostree-booted
+NVIDIA="auto"                  # auto | 1 | 0 — pass --nvidia to distrobox
+                               #      create (host NVIDIA driver in the box);
+                               #      auto => when `nvidia-smi -L` works
 
 # Anthropic's signing-key fingerprint, from the official docs
 # (https://code.claude.com/docs/en/desktop-linux). The in-container script
@@ -144,7 +152,7 @@ run_with_progress() {
   # Read PIPESTATUS straight after the pipeline — an appended `|| true` would
   # overwrite it with its own status.
   set +e
-  "$SELF" "$@" --gui --name "$NAME" 2>&1 | tee "$logf" \
+  "$SELF" "$@" --gui --name "$NAME" "${FWD_ARGS[@]}" 2>&1 | tee "$logf" \
     | zenity --progress --pulsate --auto-close --no-cancel --width=460 \
              --title="$GUI_TITLE" --text="$title" 2>/dev/null
   rc="${PIPESTATUS[0]}"
@@ -160,6 +168,8 @@ run_with_progress() {
 usage() {
   cat <<'EOF'
 Run the official Claude desktop app on Fedora via distrobox (privacy-hardened).
+Works on regular Fedora/RHEL and on image-based Fedora Atomic (Bazzite,
+Silverblue, Kinoite, …), detected automatically — see --host.
 
 Usage:
   claude-desktop-setup.sh [action] [options]
@@ -226,6 +236,20 @@ Privacy options (defaults are the hardened choices):
                    them the app only guesses that the machine slept, and in-flight
                    status (e.g. a running session's timer) can stay stale after a
                    wake. The system bus also exposes NetworkManager/UPower state.
+
+Host options:
+  --host <mode>    auto (default) | atomic | classic. "atomic" is image-based
+                   Fedora (Bazzite, Silverblue, Kinoite, …): this tool never
+                   runs `dnf install` there, never self-updates an RPM in
+                   place, and warns that distrobox always mounts
+                   /var/home/$USER. "auto" checks for /run/ostree-booted.
+  --atomic         Same as --host atomic.
+  --classic        Same as --host classic (regular Fedora/RHEL with dnf).
+  --nvidia         Pass --nvidia to distrobox create, so the app uses the
+                   host's NVIDIA driver (GPU acceleration).
+  --no-nvidia      Never pass it. Default: auto (when `nvidia-smi -L` works).
+                   Fixed when the container is created — change it with
+                   --recreate.
 
 Other options:
   --sandbox        Keep Chromium's sandbox enabled (default: --no-sandbox).
@@ -324,7 +348,12 @@ emit_meta_inner() {
   cat <<'INNER'
 #!/usr/bin/env bash
 set -euo pipefail
-bin_path="$(command -v claude-desktop || true)"
+# Ask the package, not $PATH: when the real home is mounted in the box (atomic
+# hosts, --full-home) ~/.local/bin is on PATH and holds the HOST launcher of the
+# same name, which would then exec itself inside the container.
+bin_path="$(dpkg -L claude-desktop 2>/dev/null | grep -m1 -E '^/usr/(local/)?bin/claude-desktop$' || true)"
+[ -n "$bin_path" ] || bin_path="$(command -v claude-desktop || true)"
+case "$bin_path" in "$HOME"/*|/home/*|/var/home/*) bin_path="" ;; esac
 desktop_src="$(find /usr/share/applications -maxdepth 1 -iname '*claude*.desktop' 2>/dev/null | head -n1 || true)"
 icon_name=""
 wmclass=""
@@ -380,7 +409,7 @@ install_timer() {
   mkdir -p "$unitdir"
   # Opt-in second step: ask GitHub whether a newer setup tool exists and send
   # a desktop notification. Notify-only — nothing is ever installed by itself.
-  [[ $TIMER_TOOL_CHECK -eq 1 ]] && toolexec="ExecStart=/bin/bash $self --self-check-notify"
+  [[ $TIMER_TOOL_CHECK -eq 1 ]] && toolexec="ExecStart=/bin/bash $self --self-check-notify ${FWD_ARGS[*]}"
   cat > "$unitdir/${TIMER_NAME}.service" <<EOF
 [Unit]
 Description=Update Claude Desktop (distrobox) + container base OS security patches
@@ -391,7 +420,7 @@ Type=oneshot
 # Persistent=true replays a missed run the instant the machine resumes, which
 # can land inside the few seconds before the network is back up. Wait it out.
 ExecStartPre=/usr/bin/sleep 30
-ExecStart=/bin/bash $self --update --full --notify --name $NAME
+ExecStart=/bin/bash $self --update --full --notify --name $NAME ${FWD_ARGS[*]}
 $toolexec
 TimeoutStartSec=1800
 EOF
@@ -461,6 +490,11 @@ while [[ $# -gt 0 ]]; do
     --box-home)     BOX_HOME="${2:?--box-home requires a path}"; shift 2 ;;
     --name)         NAME="${2:?--name requires a value}"; shift 2 ;;
     --image)        IMAGE="${2:?--image requires a value}"; shift 2 ;;
+    --host)         HOST_MODE="${2:?--host requires auto|atomic|classic}"; shift 2 ;;
+    --atomic)       HOST_MODE="atomic"; shift ;;
+    --classic)      HOST_MODE="classic"; shift ;;
+    --nvidia)       NVIDIA=1; shift ;;
+    --no-nvidia)    NVIDIA=0; shift ;;
     -h|--help)      usage ;;
     *)              die "unknown option: $1 (try --help)" ;;
   esac
@@ -471,10 +505,32 @@ if [[ "$ACTION" == "print-inner" ]]; then
   exit 0
 fi
 
+# Host type. Decided before anything that might reach for dnf (self-update,
+# ensure_tool) so a forced --host applies everywhere.
+case "$HOST_MODE" in
+  atomic)  IS_ATOMIC=1; HOST_SOURCE="forced by --host" ;;
+  classic) IS_ATOMIC=0; HOST_SOURCE="forced by --host" ;;
+  auto)    IS_ATOMIC=0; HOST_SOURCE="auto-detected"
+           [[ -e /run/ostree-booted ]] && IS_ATOMIC=1 ;;
+  *)       die "--host must be auto, atomic or classic (got '$HOST_MODE')" ;;
+esac
+# Explicit host/GPU choices, re-passed whenever this script calls itself again
+# (GUI actions, launcher right-click actions, the auto-update timer).
+declare -a FWD_ARGS=()
+[[ "$HOST_MODE" != auto ]] && FWD_ARGS+=(--host "$HOST_MODE")
+case "$NVIDIA" in
+  1) FWD_ARGS+=(--nvidia) ;;
+  0) FWD_ARGS+=(--no-nvidia) ;;
+esac
+
 # `--gui` with no explicit action opens the menu.
 if [[ $GUI -eq 1 && $ACTION_SET -eq 0 ]]; then ACTION="gui-menu"; fi
 if [[ $GUI -eq 1 ]] && ! command -v zenity >/dev/null 2>&1; then
-  warn "--gui requested but zenity is not installed (dnf install zenity); using terminal output."
+  if [[ $IS_ATOMIC -eq 1 ]]; then
+    warn "--gui requested but zenity is not installed (layer it: rpm-ostree install zenity); using terminal output."
+  else
+    warn "--gui requested but zenity is not installed (dnf install zenity); using terminal output."
+  fi
   GUI=0
   [[ "$ACTION" == "gui-menu" ]] && die "The setup menu needs zenity. Install it or use the command-line flags (--help)."
 fi
@@ -492,7 +548,10 @@ if [[ "$ACTION" == "remove-timer" ]]; then remove_timer; exit 0; fi
 # ---------------------------------------------------------------------------
 # Installed from the RPM (as opposed to a git checkout)? Only then can we
 # upgrade in place: download the release RPM, verify it, hand it to dnf.
+# Never on an atomic host: there is no dnf install, and an RPM layered with
+# rpm-ostree is a local package that only changes on the next reboot.
 rpm_installed() {
+  [[ $IS_ATOMIC -eq 0 ]] || return 1
   [[ "$SELF" == /usr/bin/claude-desktop-setup ]] && rpm -qf /usr/bin/claude-desktop-setup >/dev/null 2>&1
 }
 
@@ -571,8 +630,12 @@ self_check() {
     fi
     [[ $go -eq 1 ]] && { self_update_install "$json" "$latest" || return 1; }
   else
-    # Git checkout (or no polkit): can't replace ourselves safely — point at the page.
-    log "You are not running the RPM; get the new version from $RELEASES_URL"
+    # Git checkout, atomic host or no polkit: can't replace ourselves safely — point at the page.
+    if [[ $IS_ATOMIC -eq 1 ]]; then
+      log "Atomic host: update your git clone (git pull) or get the new version from $RELEASES_URL"
+    else
+      log "You are not running the RPM; get the new version from $RELEASES_URL"
+    fi
     if have_gui && gui_question "Version <b>$latest</b> of Claude Desktop Setup is available (you have $VERSION).\n\nOpen the download page?"; then
       xdg-open "$RELEASES_URL" >/dev/null 2>&1 &
     fi
@@ -593,8 +656,9 @@ case "$ARCH" in
   *) die "unsupported architecture: $ARCH (need x86_64 or aarch64)." ;;
 esac
 
+# dnf exists on atomic hosts too, but only for repo management — never use it there.
 HAVE_DNF=0
-command -v dnf >/dev/null 2>&1 && HAVE_DNF=1
+[[ $IS_ATOMIC -eq 0 ]] && command -v dnf >/dev/null 2>&1 && HAVE_DNF=1
 
 # ---------------------------------------------------------------------------
 # Ensure distrobox + a container manager
@@ -602,6 +666,10 @@ command -v dnf >/dev/null 2>&1 && HAVE_DNF=1
 ensure_tool() {
   local tool="$1" pkg="$2"
   command -v "$tool" >/dev/null 2>&1 && return 0
+  if [[ $IS_ATOMIC -eq 1 ]]; then
+    # Layering changes the OS image and needs a reboot — the user's call, not ours.
+    die "'$tool' is missing on this atomic host. Bazzite ships it in the image; elsewhere layer it with: rpm-ostree install $pkg (then reboot) and run this again."
+  fi
   [[ $HAVE_DNF -eq 1 ]] || die "'$tool' is missing and dnf isn't available. Please install '$pkg' manually."
   if have_gui && command -v pkexec >/dev/null 2>&1; then
     # No terminal for a sudo password in GUI mode — use polkit's dialog instead.
@@ -631,6 +699,39 @@ container_exists() {
 # warn instead of failing on very old versions.
 distrobox_supports_netns() {
   distrobox create --help 2>&1 | grep -q -- '--unshare-netns'
+}
+distrobox_supports_nvidia() {
+  distrobox create --help 2>&1 | grep -q -- '--nvidia'
+}
+
+# On ostree hosts distrobox-create adds a bind mount of /var/home/$USER unless
+# $HOME is literally that path — and with an isolated home it never is — and
+# distrobox-init then binds it over /home/$USER on every start. Both are
+# hard-coded, so the real home is visible inside the container at both paths.
+atomic_home_exposed() {
+  [[ $IS_ATOMIC -eq 1 && $ISOLATE_HOME -eq 1 && -d "/var/home/$USER" ]]
+}
+
+# That /home/$USER bind lands on top of our read-only user-folder mounts under
+# /home, making them writable again. An init hook (runs after distrobox's own
+# mounts, at every container start) re-binds each one from its read-only
+# real-path mount. Prints the hook, or nothing when none is needed. The string
+# goes through two evals in distrobox, so paths with quotes or $ are skipped.
+atomic_ro_hook() {
+  atomic_home_exposed || return 0
+  local m real l hook=""
+  for m in "${USER_DIR_MOUNTS[@]:-}"; do
+    [[ -n "$m" && "${m##*:}" == ro ]] || continue
+    real="${m%%:*}"; l="${m#*:}"; l="${l%:*}"
+    [[ "$l" == /home/* && "$l" != "$real" ]] || continue
+    case "$real$l" in
+      *[\'\"\$\\\`*?[]*)
+        warn "Cannot re-protect $l (unusual characters): it stays writable inside the container."
+        continue ;;
+    esac
+    hook+="mount --bind '$real' '$l' && mount -o remount,bind,ro '$l' || true; "
+  done
+  printf '%s' "$hook"
 }
 
 # ---------------------------------------------------------------------------
@@ -943,6 +1044,9 @@ WRAP
   local update_exec settings_exec
   update_exec="$(printf '%q --update --full --gui --name %q' "$SELF" "$NAME")"
   settings_exec="$(printf '%q --gui --name %q' "$SELF" "$NAME")"
+  if [[ ${#FWD_ARGS[@]} -gt 0 ]]; then
+    update_exec+=" ${FWD_ARGS[*]}"; settings_exec+=" ${FWD_ARGS[*]}"
+  fi
   sed -i -e '/^\[Desktop Action Update\]/,/^$/d' \
          -e '/^\[Desktop Action Settings\]/,/^$/d' "$HOST_DESKTOP"   # drop stale copies
   local act
@@ -1008,10 +1112,28 @@ remove_host_launcher() {
 # so imports and drops fail silently. Mounting the standard user folders at
 # their real paths (read-only where possible) fixes that without exposing the
 # rest of the home.
+#
+# Each folder is recorded twice-over: its real path (symlinks resolved) and its
+# logical path (as the host spells it). They differ on atomic hosts, where
+# /home -> /var/home: the file manager hands out /home/you/..., readlink gives
+# /var/home/you/..., and the folder must exist at both inside the container.
+
+# Absolute path of $1 WITHOUT resolving symlinks (/home/you/x stays that).
+logical_path() { realpath -s -- "$1" 2>/dev/null || printf '%s\n' "$1"; }
+
+# "--volume" args for one mount: $1 real path, $2 logical path, $3 ro|rw.
+# Appends to the CREATE array; the logical path only when it differs.
+add_volume() {
+  CREATE+=(--volume "$1:$1:$3")
+  [[ "$2" == "$1" ]] || CREATE+=(--volume "$1:$2:$3")
+}
+
 resolve_user_dirs() {
   USER_DIR_MOUNTS=()
   [[ $USER_DIRS -eq 1 && $ISOLATE_HOME -eq 1 ]] || return 0
-  local key mode d
+  local key mode d l real_home box_home
+  real_home="$(readlink -f "$REAL_HOME" 2>/dev/null || printf '%s' "$REAL_HOME")"
+  box_home="$(readlink -f "$BOX_HOME" 2>/dev/null || printf '%s' "$BOX_HOME")"
   for key in DOCUMENTS:ro DESKTOP:ro PICTURES:ro DOWNLOAD:rw; do
     mode="${key#*:}"; key="${key%%:*}"
     if command -v xdg-user-dir >/dev/null 2>&1; then
@@ -1027,11 +1149,14 @@ resolve_user_dirs() {
         DOWNLOAD)  d="$REAL_HOME/Downloads" ;;
       esac
     fi
+    l="$(logical_path "$d")"
     d="$(readlink -f "$d" 2>/dev/null || true)"
     # xdg-user-dir falls back to $HOME itself for unset keys — never mount that.
-    [[ -n "$d" && -d "$d" && "$d" != "$REAL_HOME" && "$d" != "$BOX_HOME" ]] || continue
+    # Compare resolved paths: on atomic hosts $HOME is /home/you but resolves
+    # to /var/home/you.
+    [[ -n "$d" && -d "$d" && "$d" != "$real_home" && "$d" != "$box_home" ]] || continue
     case " ${USER_DIR_MOUNTS[*]:-} " in *" $d:"*) continue ;; esac
-    USER_DIR_MOUNTS+=("$d:$mode")
+    USER_DIR_MOUNTS+=("$d:$l:$mode")
   done
 }
 
@@ -1042,9 +1167,14 @@ link_shared_dirs_into_box_home() {
   [[ $ISOLATE_HOME -eq 1 ]] || return 0
   local entry d name bm="$BOX_HOME/.config/gtk-3.0/bookmarks"
   mkdir -p "$(dirname "$bm")"; touch "$bm"
+  # Point at the logical path — the one the host hands over on drag-and-drop.
   for entry in "${USER_DIR_MOUNTS[@]:-}" "${SHARES[@]:-}"; do
     [[ -z "$entry" ]] && continue
-    d="${entry%%:*}"; d="$(readlink -f "$d" 2>/dev/null || true)"
+    if [[ "$entry" == *:*:* ]]; then
+      d="${entry#*:}"; d="${d%:*}"            # USER_DIR_MOUNTS: real:logical:mode
+    else
+      d="$(logical_path "$entry")"             # --share dir as given
+    fi
     [[ -n "$d" && -d "$d" ]] || continue
     name="$(basename "$d")"
     if [[ -L "$BOX_HOME/$name" || ! -e "$BOX_HOME/$name" ]]; then
@@ -1061,10 +1191,12 @@ container_missing_user_dirs() {
   [[ $ISOLATE_HOME -eq 1 ]] || return 1
   resolve_user_dirs
   [[ ${#USER_DIR_MOUNTS[@]} -gt 0 ]] || return 1
-  local dests m
+  local dests m l
   dests="$("$MGR" inspect "$NAME" --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null)" || return 1
   for m in "${USER_DIR_MOUNTS[@]}"; do
+    l="${m#*:}"; l="${l%:*}"
     grep -qxF "${m%%:*}" <<<"$dests" || return 0
+    grep -qxF "$l" <<<"$dests" || return 0
   done
   return 1
 }
@@ -1088,6 +1220,11 @@ case "$ACTION" in
     if container_exists "$NAME"; then
       log "Container '$NAME' already exists — reusing it."
     else
+      if [[ $IS_ATOMIC -eq 1 ]]; then
+        log "Host: atomic / image-based Fedora ($HOST_SOURCE) — no dnf, user-level setup only."
+      else
+        log "Host: classic Fedora/RHEL ($HOST_SOURCE)."
+      fi
       # Assemble create args with the chosen isolation posture.
       declare -a CREATE=(create --name "$NAME" --image "$IMAGE" --yes)
       declare -a CREATE_ENV=()   # env overrides applied ONLY to `distrobox create`
@@ -1107,6 +1244,11 @@ case "$ACTION" in
           "XDG_CACHE_HOME=$REAL_HOME/.cache")
         log "Filesystem: ISOLATED — sandbox home $BOX_HOME; real \$HOME not mounted"
         log "            (reachable only via /run/host — a soft boundary, see --help)."
+        if atomic_home_exposed; then
+          warn "Atomic host: distrobox always mounts /var/home/$USER on ostree systems (also"
+          warn "over /home/$USER), so your real home IS visible and writable inside the container."
+          warn "The app still starts in $BOX_HOME, but treat home isolation as off."
+        fi
       else
         warn "Filesystem: FULL — the app will see your real \$HOME."
       fi
@@ -1123,13 +1265,31 @@ case "$ACTION" in
         warn "Network: SHARED — the app shares your host network namespace."
       fi
 
+      # Host NVIDIA driver inside the box (GPU acceleration for Electron).
+      use_nvidia=0
+      case "$NVIDIA" in
+        1) use_nvidia=1 ;;
+        auto) command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 && use_nvidia=1 ;;
+      esac
+      if [[ $use_nvidia -eq 1 ]]; then
+        if distrobox_supports_nvidia; then
+          CREATE+=(--nvidia)
+          log "GPU: NVIDIA driver from the host (--nvidia)."
+        else
+          warn "This distrobox lacks --nvidia; the app will run without the NVIDIA driver."
+        fi
+      fi
+
       # Standard user folders at their real paths (see resolve_user_dirs).
       resolve_user_dirs
       if [[ ${#USER_DIR_MOUNTS[@]} -gt 0 ]]; then
         for s in "${USER_DIR_MOUNTS[@]}"; do
-          CREATE+=(--volume "${s%%:*}:${s%%:*}:${s##*:}")
-          log "User folder: ${s%%:*} (${s##*:})"
+          l="${s#*:}"; l="${l%:*}"
+          add_volume "${s%%:*}" "$l" "${s##*:}"
+          log "User folder: $l (${s##*:})"
         done
+        ro_hook="$(atomic_ro_hook)"
+        [[ -z "$ro_hook" ]] || CREATE+=(--init-hooks "$ro_hook")
       elif [[ $ISOLATE_HOME -eq 1 ]]; then
         warn "No standard user folders exposed (--no-user-dirs): attaching files and"
         warn "drag-and-drop only work for files under $BOX_HOME or a --share dir."
@@ -1138,10 +1298,11 @@ case "$ACTION" in
       # Explicitly shared host directories.
       for s in "${SHARES[@]:-}"; do
         [[ -z "$s" ]] && continue
+        l="$(logical_path "$s")"
         s="$(readlink -f "$s")" || die "bad --share path: $s"
         [[ -d "$s" ]] || die "--share path is not a directory: $s"
-        CREATE+=(--volume "$s:$s:rw")
-        log "Sharing host dir: $s"
+        add_volume "$s" "$l" rw
+        log "Sharing host dir: $l"
       done
 
       log "Creating Ubuntu container '$NAME' (image: $IMAGE) ..."
@@ -1177,7 +1338,11 @@ case "$ACTION" in
       if [[ $ISOLATE_HOME -eq 1 ]]; then
         msg+="• The app only sees its own folder ($BOX_HOME)"
         [[ ${#SHARES[@]} -gt 0 ]] && msg+=" plus the folders you shared"
-        msg+=" — your real home stays hidden.\n"
+        if atomic_home_exposed; then
+          msg+=". Note: on this atomic system distrobox also mounts your real home (/home/$USER and /var/home/$USER).\n"
+        else
+          msg+=" — your real home stays hidden.\n"
+        fi
       fi
       [[ $ISOLATE_NET -eq 1 ]] && msg+="• It runs in its own network namespace (internet yes, your host's localhost no).\n"
       msg+="\nTo update later: right-click the Claude icon → <b>Check for updates</b>, or open <b>Claude Desktop Setup</b>."
@@ -1332,7 +1497,7 @@ case "$ACTION" in
     # inside the window — only the zenity fallback still emits the
     # auto:<…> / toolcheck:<on|off> tokens for them.
     gtk_menu() {
-      python3 - "$1" "$2" "$3" "$GUI_TITLE" "$SELF" "$NAME" <<'PYEOF'
+      python3 - "$1" "$2" "$3" "$GUI_TITLE" "$SELF" "$NAME" "${FWD_ARGS[*]}" <<'PYEOF'
 import sys
 import gi
 gi.require_version("Gtk", "4.0")
@@ -1345,6 +1510,7 @@ toolcheck = sys.argv[3] == "1"
 title = sys.argv[4]
 selfpath = sys.argv[5]
 boxname = sys.argv[6]
+fwdargs = sys.argv[7].split()
 chosen = []
 
 
@@ -1384,7 +1550,7 @@ class Setup(Adw.Application):
             cmd = ["/bin/bash", selfpath, "--remove-timer"]
         else:
             cmd = ["/bin/bash", selfpath, "--install-timer",
-                   "--every", new_freq, "--name", boxname]
+                   "--every", new_freq, "--name", boxname] + fwdargs
             if new_tool:
                 cmd.append("--tool-check")
         self.sched_box.set_sensitive(False)
@@ -1606,7 +1772,7 @@ PYEOF
           fi
           ;;
         self-check)
-          "$SELF" --check-self-update --gui || true
+          "$SELF" --check-self-update --gui "${FWD_ARGS[@]}" || true
           ;;
         repair)
           run_with_progress "Rebuilding the app-menu entry…" --refresh-launcher && \

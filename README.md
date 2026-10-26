@@ -24,6 +24,7 @@ sign-in, the works — while keeping it out of your real home directory and off 
 - [Easy install (Fedora, GUI)](#easy-install-fedora-gui)
 - [Requirements](#requirements)
 - [Install from source (advanced)](#install-from-source-advanced)
+- [Fedora Atomic / Bazzite](#fedora-atomic--bazzite)
 - [Use it](#use-it)
 - [Update it](#update-it)
 - [Remove it](#remove-it)
@@ -176,7 +177,8 @@ setup tool gone.
 ## Requirements
 
 - **Fedora / RHEL-family** (or any Linux with the tools below). On Fedora the script auto-installs
-  missing pieces via `dnf`.
+  missing pieces via `dnf`. **Fedora Atomic** (Bazzite, Silverblue, Kinoite, …) works too — see
+  [Fedora Atomic / Bazzite](#fedora-atomic--bazzite).
 - **podman** (rootless) *or* docker, and **distrobox**.
 - **x86_64** or **aarch64**.
 - A **graphical session** (Wayland or X11).
@@ -217,6 +219,45 @@ Want to work on real project folders (Cowork/Code)? Grant them explicitly:
 ```bash
 ./claude-desktop-setup.sh --share ~/Projects --share ~/Notes
 ```
+
+## Fedora Atomic / Bazzite
+
+On image-based Fedora (rpm-ostree / bootc) `/usr` is read-only and `dnf install` does not work.
+The script detects this (`/run/ostree-booted`) and switches to an **atomic** mode; force either
+mode with `--host atomic|classic` (or `--atomic` / `--classic`) if detection guesses wrong.
+
+- **Install from a git clone**, not the RPM — layering it with `rpm-ostree` is a last resort
+  and a local RPM never auto-updates. Bazzite already ships `distrobox`, `podman`, `zenity` and
+  the GTK4 bindings, so nothing needs layering:
+
+  ```bash
+  git clone https://github.com/DaveTheGameDev/claude-desktop-fedora.git
+  cd claude-desktop-fedora
+  ./claude-desktop-setup.sh          # or --gui
+  ```
+
+- **No `dnf`, ever.** A missing tool stops with a hint (`rpm-ostree install <pkg>`, then reboot)
+  instead of trying to install it. `--check-self-update` points at the releases page; update the
+  tool with `git pull`.
+- **`/home` is a symlink to `/var/home`.** File managers hand out `/home/you/…` paths, so user
+  folders and `--share` dirs are mounted at both the `/home/…` and the `/var/home/…` path —
+  drag-and-drop and *Attach file* work either way.
+- **NVIDIA images** (e.g. `bazzite-nvidia-open`): the container gets the host driver via
+  distrobox `--nvidia` automatically when `nvidia-smi -L` works. Override with `--nvidia` /
+  `--no-nvidia` (takes effect on create or `--recreate`).
+- The container is an ordinary distrobox, so it also shows up in GUI managers such as
+  **Kontainer** or BoxBuddy. Manage it with this script, though — recreating it elsewhere drops
+  the isolation flags.
+- An explicit `--host` / `--nvidia` choice is remembered in the launcher's right-click actions and
+  the auto-update timer.
+
+> **Caveat — home isolation is off here.** On ostree systems distrobox *always* bind-mounts
+> `/var/home/$USER` into the container (hard-coded in `distrobox-create`) and `distrobox-init`
+> binds it over `/home/$USER` on every start, so your real home is visible **and writable** inside
+> the box, not only via `/run/host`. The app still starts in its sandbox home, but don't rely on
+> home isolation on an atomic host. The script warns about this during install, and an init hook
+> re-applies read-only mounts for Documents/Desktop/Pictures under `/home/you/…` (recreate
+> containers made before that with `--recreate`).
 
 ## Use it
 
@@ -323,6 +364,8 @@ Add `--purge` only if you also want the sandbox home gone.
 | `--sandbox` | Keep Chromium's sandbox enabled (default: `--no-sandbox`). |
 | `--name <name>` | Container name (default `claude-desktop`). |
 | `--image <image>` | Base image (default `ubuntu:24.04`; needs Ubuntu 22.04+/Debian 12+). |
+| `--host auto\|atomic\|classic` | Host type. `auto` (default) detects image-based Fedora via `/run/ostree-booted`; `atomic` never uses `dnf` or RPM self-update; `classic` is regular Fedora/RHEL. `--atomic` / `--classic` are shorthands. |
+| `--nvidia` / `--no-nvidia` | Force / forbid distrobox `--nvidia` (host NVIDIA driver in the box). Default: auto when `nvidia-smi -L` works. Fixed at creation — use `--recreate` to change. |
 | `--print-inner` | Print the in-container install script (for review) and exit. |
 | `-h`, `--help` | Show help. |
 
@@ -421,10 +464,13 @@ your session bus (`notify-send`); if none is reachable the run is still fully lo
 ## Limitations & honest caveats
 
 - **Soft boundary, not a VM** — real home reachable via `/run/host` (see [Security](#security--trust-model)).
+  On **Fedora Atomic / Bazzite** distrobox itself mounts it at `/var/home/$USER` and `/home/$USER`
+  (see [Fedora Atomic / Bazzite](#fedora-atomic--bazzite)).
 - **Beta app** — Computer Use and dictation aren't in the Linux beta; the Quick-Entry global hotkey
   needs your DE's GlobalShortcuts portal on native Wayland.
 - **Not automatic unless you enable the timer** — nothing updates the container on its own otherwise.
-- Tested on **Fedora 44 (GNOME/Wayland), x86_64, podman 5.x, distrobox 1.8.x**.
+- Tested on **Fedora 44 (GNOME/Wayland), x86_64, podman 5.x, distrobox 1.8.x**; atomic mode
+  developed on **Bazzite 44 (KDE/Wayland, NVIDIA), distrobox 1.8.2**.
 
 ---
 
